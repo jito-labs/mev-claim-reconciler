@@ -1,0 +1,3 @@
+[submodule "jito-programs"]
+	path = jito-programs
+	url = git@github.com:jito-foundation/jito-programs.git
