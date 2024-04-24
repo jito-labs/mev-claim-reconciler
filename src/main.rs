@@ -1,5 +1,6 @@
 use anchor_lang::AccountDeserialize;
 use clap::Parser;
+use csv::Writer;
 use futures::future::join_all;
 use jito_tip_distribution::state::{Config, TipDistributionAccount};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -10,11 +11,13 @@ use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task::spawn_blocking;
+use tokio::time::sleep;
 
 /// Issue occurred on 04/23/2024 where one warehouse node created an incorrect snapshot and uploaded
 /// that as the root for some TDAs. The snapshot was incorrect because it only included ~91% of epoch
@@ -93,19 +96,15 @@ pub struct TreeNode {
 }
 
 #[derive(Deserialize, Serialize)]
-struct DiscrepancyOutputColl {
-    num_validators_affected: usize,
-    /// abs(incorrect snapshot total - incorrect snapshot total)
-    total_lamports_diff: u64,
-    discrepancies: Vec<DiscrepancyOutput>,
-}
-
-#[derive(Deserialize, Serialize)]
 struct DiscrepancyOutput {
     #[serde(with = "pubkey_string_conversion")]
     validator_pubkey: Pubkey,
-    /// Correct snapshot total - incorrect snapshot total
-    lamports_diff: i64,
+
+    /// Correct snapshot total - incorrect snapshot total, this is only stakers not validator funds
+    staker_lamports_diff: i64,
+
+    /// Correct snapshot validator funds - incorrect snapshot validator funds, this is only the validator diff not stakers.
+    validator_lamports_diff: i64,
 }
 
 #[tokio::main]
@@ -160,8 +159,19 @@ async fn main() {
         let tda = tree.tip_distribution_account;
         let c = rpc_client.clone();
         futs.push(async move {
-            let account = c.get_account(&tda).await;
-            (tda, account)
+            const MAX_RETRIES: usize = 10;
+            let mut retry_count = 0;
+            loop {
+                let account = c.get_account(&tda).await;
+                if account.is_ok() {
+                    return (tda, account);
+                }
+                if retry_count >= MAX_RETRIES {
+                    return (tda, account);
+                }
+                retry_count += 1;
+                sleep(Duration::from_millis(500)).await;
+            }
         });
     }
 
@@ -179,7 +189,6 @@ async fn main() {
     }
 
     let mut discrepancies = Vec::new();
-    let mut total_lamports_diff = 0u64;
     // Check the merkle roots against the snapshots
     for (pk, tda) in onchain_tdas {
         let actual_root = tda.merkle_root.unwrap();
@@ -192,7 +201,15 @@ async fn main() {
             continue;
         }
 
-        let lamports_diff = match incorrect_roots.get(&pk) {
+        let correct_validator_amount = (correct_tda.max_total_claim as u128)
+            .checked_mul(tda.validator_commission_bps as u128)
+            .unwrap()
+            .checked_div(10_000)
+            .unwrap() as i64;
+        let correct_staker_amount =
+            correct_tda.max_total_claim as i64 - correct_validator_amount as i64;
+
+        let (validator_lamports_diff, staker_lamports_diff) = match incorrect_roots.get(&pk) {
             Some(incorrect_tda) => {
                 if actual_root.root != incorrect_tda.merkle_root.to_bytes() {
                     panic!(
@@ -200,30 +217,46 @@ async fn main() {
                         pk
                     );
                 }
-                correct_tda.max_total_claim as i64 - incorrect_tda.max_total_claim as i64
+
+                // Calc. incorrect amounts.
+                let correct_validator_amount = (correct_tda.max_total_claim as u128)
+                    .checked_mul(tda.validator_commission_bps as u128)
+                    .unwrap()
+                    .checked_div(10_000)
+                    .unwrap() as i64;
+                let incorrect_validator_amount = (incorrect_tda.max_total_claim as u128)
+                    .checked_mul(tda.validator_commission_bps as u128)
+                    .unwrap()
+                    .checked_div(10_000)
+                    .unwrap() as i64;
+                let incorrect_staker_amount =
+                    incorrect_tda.max_total_claim as i64 - incorrect_validator_amount as i64;
+
+                // Subtract validator's commission
+                (
+                    correct_validator_amount - incorrect_validator_amount,
+                    correct_staker_amount - incorrect_staker_amount,
+                )
             }
+            // If not in the incorrect snapshot, then the validator probably came on later in the epoch after the incorrect snapshot was created.
+            // Therefore we need to reimburse the entire thing from the correct amount.
             None => {
                 println!("missing {pk} from incorrect snapshot");
-                correct_tda.max_total_claim as i64
+                (correct_validator_amount, correct_staker_amount)
             }
         };
 
         discrepancies.push(DiscrepancyOutput {
             validator_pubkey: tda.validator_vote_account,
-            lamports_diff,
+            staker_lamports_diff,
+            validator_lamports_diff,
         });
-        total_lamports_diff += lamports_diff.abs() as u64;
     }
-    let output = DiscrepancyOutputColl {
-        num_validators_affected: discrepancies.len(),
-        total_lamports_diff,
-        discrepancies,
-    };
 
     println!("writing discrepancies...");
 
     let out_path = args.out_path;
-    spawn_blocking(move || write_to_json_file(&output, &out_path).unwrap())
+    spawn_blocking(move || write_to_csv(&discrepancies, &out_path).unwrap())
         .await
         .unwrap();
 
@@ -264,12 +297,10 @@ pub fn derive_config_account_address(tip_distribution_program_id: &Pubkey) -> (P
     Pubkey::find_program_address(&[Config::SEED], tip_distribution_program_id)
 }
 
-fn write_to_json_file(data: &DiscrepancyOutputColl, file_path: &PathBuf) -> io::Result<()> {
-    let file = File::create(file_path)?;
-    let mut writer = BufWriter::new(file);
-    let json = serde_json::to_string_pretty(&data).unwrap();
-    writer.write_all(json.as_bytes())?;
-    writer.flush()?;
-
-    Ok(())
+fn write_to_csv(discrepancies: &[DiscrepancyOutput], out_path: &PathBuf) -> io::Result<()> {
+    let mut w = Writer::from_path(out_path)?;
+    for d in discrepancies {
+        w.serialize(d)?;
+    }
+    w.flush()
 }
