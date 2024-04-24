@@ -224,7 +224,6 @@ mod pubkey_string_conversion {
     use solana_program::pubkey::Pubkey;
     use {
         serde::{self, Deserialize, Deserializer, Serializer},
-        solana_sdk::pubkey::Pubkey,
         std::str::FromStr,
     };
 
