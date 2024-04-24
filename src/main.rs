@@ -1,7 +1,7 @@
 use anchor_lang::AccountDeserialize;
 use clap::Parser;
 use futures::future::join_all;
-use jito_tip_distribution::state::TipDistributionAccount;
+use jito_tip_distribution::state::{Config, TipDistributionAccount};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use solana_program::clock::{Epoch, Slot};
 use solana_program::hash::Hash;
@@ -110,11 +110,24 @@ struct DiscrepancyOutput {
 
 #[tokio::main]
 async fn main() {
-    // let tip_distribution_program: Pubkey =
-    //     Pubkey::from_str("4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7").unwrap();
+    let tip_distribution_program: Pubkey =
+        Pubkey::from_str("4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7").unwrap();
 
     println!("Starting...");
+
     let args: Args = Args::parse();
+
+    let rpc_client = Arc::new(RpcClient::new(args.rpc_url));
+    println!(
+        "rpc server version: {}",
+        rpc_client.get_version().await.unwrap().solana_core
+    );
+
+    let (config_account, _) = derive_config_account_address(&tip_distribution_program);
+    let account = rpc_client.get_account(&config_account).await.unwrap();
+    let mut data = account.data.as_slice();
+    let config: Config = Config::try_deserialize(&mut data).unwrap();
+    println!("expired funds account: {}", config.expired_funds_account);
 
     println!("reading in snapshot files...");
     let incorrect_snapshot_path = args.incorrect_snapshot_path.clone();
@@ -144,12 +157,6 @@ async fn main() {
         correct_roots.keys().collect::<HashSet<_>>(),
         incorrect_roots.keys().collect::<HashSet<_>>(),
         "snapshots contain different tip distribution accounts"
-    );
-
-    let rpc_client = Arc::new(RpcClient::new(args.rpc_url));
-    println!(
-        "rpc server version: {}",
-        rpc_client.get_version().await.unwrap().solana_core
     );
 
     // Get all tip distribution accounts
@@ -230,6 +237,7 @@ where
 mod pubkey_string_conversion {
     use serde::{self, Deserialize, Deserializer, Serializer};
     use solana_program::pubkey::Pubkey;
+    use std::str::FromStr;
 
     pub(crate) fn serialize<S>(pubkey: &Pubkey, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -245,6 +253,10 @@ mod pubkey_string_conversion {
         let s = String::deserialize(deserializer)?;
         Pubkey::from_str(&s).map_err(serde::de::Error::custom)
     }
+}
+
+pub fn derive_config_account_address(tip_distribution_program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[Config::SEED], tip_distribution_program_id)
 }
 
 fn write_to_json_file(data: &DiscrepancyOutputColl, file_path: &PathBuf) -> io::Result<()> {
