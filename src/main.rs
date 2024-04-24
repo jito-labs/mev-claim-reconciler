@@ -7,7 +7,7 @@ use solana_program::clock::{Epoch, Slot};
 use solana_program::hash::Hash;
 use solana_program::pubkey::Pubkey;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::io::{BufReader, BufWriter, Write};
@@ -96,7 +96,7 @@ pub struct TreeNode {
 struct DiscrepancyOutputColl {
     num_validators_affected: usize,
     /// abs(incorrect snapshot total - incorrect snapshot total)
-    total_sol_diff: u64,
+    total_lamports_diff: u64,
     discrepancies: Vec<DiscrepancyOutput>,
 }
 
@@ -105,7 +105,7 @@ struct DiscrepancyOutput {
     #[serde(with = "pubkey_string_conversion")]
     validator_pubkey: Pubkey,
     /// Correct snapshot total - incorrect snapshot total
-    sol_diff: i64,
+    lamports_diff: i64,
 }
 
 #[tokio::main]
@@ -142,8 +142,9 @@ async fn main() {
             .unwrap();
 
     // Create map of TDA pubkey to merkle root for easy lookup later
-    let mut correct_roots = HashMap::with_capacity(correct_snapshot.generated_merkle_trees.len());
-    let mut incorrect_roots =
+    let mut correct_roots: HashMap<Pubkey, &GeneratedMerkleTree> =
+        HashMap::with_capacity(correct_snapshot.generated_merkle_trees.len());
+    let mut incorrect_roots: HashMap<Pubkey, &GeneratedMerkleTree> =
         HashMap::with_capacity(incorrect_snapshot.generated_merkle_trees.len());
     for tree in &incorrect_snapshot.generated_merkle_trees {
         incorrect_roots.insert(tree.tip_distribution_account, tree);
@@ -152,17 +153,10 @@ async fn main() {
         correct_roots.insert(tree.tip_distribution_account, tree);
     }
 
-    // Make sure both snapshots have exactly the same TDAs.
-    assert_eq!(
-        correct_roots.keys().collect::<HashSet<_>>(),
-        incorrect_roots.keys().collect::<HashSet<_>>(),
-        "snapshots contain different tip distribution accounts"
-    );
-
     // Get all tip distribution accounts
     println!("fetching tip distribution accounts");
     let mut futs = Vec::with_capacity(incorrect_snapshot.generated_merkle_trees.len());
-    for tree in &incorrect_snapshot.generated_merkle_trees {
+    for tree in &correct_snapshot.generated_merkle_trees {
         let tda = tree.tip_distribution_account;
         let c = rpc_client.clone();
         futs.push(async move {
@@ -185,33 +179,44 @@ async fn main() {
     }
 
     let mut discrepancies = Vec::new();
-    let mut total_sol_diff = 0u64;
+    let mut total_lamports_diff = 0u64;
     // Check the merkle roots against the snapshots
     for (pk, tda) in onchain_tdas {
         let actual_root = tda.merkle_root.unwrap();
-        let correct_tda = correct_roots.get(&pk).unwrap();
-        let incorrect_tda = incorrect_roots.get(&pk).unwrap();
 
-        if actual_root.root == correct_tda.merkle_root.to_bytes() {
+        let Some(correct_tda) = correct_roots.get(&pk) else {
+            panic!("missing {pk} from correct snapshot");
+        };
+
+        if correct_tda.merkle_root.to_bytes() == actual_root.root {
             continue;
         }
-        if actual_root.root != incorrect_tda.merkle_root.to_bytes() {
-            panic!(
-                "account {} does not contain a root matching either snapshot",
-                pk
-            );
-        }
 
-        let sol_diff = correct_tda.max_total_claim as i64 - incorrect_tda.max_total_claim as i64;
+        let lamports_diff = match incorrect_roots.get(&pk) {
+            Some(incorrect_tda) => {
+                if actual_root.root != incorrect_tda.merkle_root.to_bytes() {
+                    panic!(
+                        "account {} does not contain a root matching either snapshot",
+                        pk
+                    );
+                }
+                correct_tda.max_total_claim as i64 - incorrect_tda.max_total_claim as i64
+            }
+            None => {
+                println!("missing {pk} from incorrect snapshot");
+                correct_tda.max_total_claim as i64
+            }
+        };
+
         discrepancies.push(DiscrepancyOutput {
             validator_pubkey: tda.validator_vote_account,
-            sol_diff,
+            lamports_diff,
         });
-        total_sol_diff += sol_diff.abs() as u64;
+        total_lamports_diff += lamports_diff.abs() as u64;
     }
     let output = DiscrepancyOutputColl {
         num_validators_affected: discrepancies.len(),
-        total_sol_diff,
+        total_lamports_diff,
         discrepancies,
     };
 
