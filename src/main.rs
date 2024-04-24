@@ -1,3 +1,4 @@
+use anchor_lang::AccountDeserialize;
 use clap::Parser;
 use futures::future::join_all;
 use jito_tip_distribution::state::TipDistributionAccount;
@@ -8,9 +9,11 @@ use solana_program::pubkey::Pubkey;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::task::spawn_blocking;
 
 /// Issue occurred on 04/23/2024 where one warehouse node created an incorrect snapshot and uploaded
@@ -89,6 +92,7 @@ pub struct TreeNode {
     pub proof: Vec<[u8; 32]>,
 }
 
+#[derive(Deserialize, Serialize)]
 struct DiscrepancyOutputColl {
     num_validators_affected: usize,
     /// abs(incorrect snapshot total - incorrect snapshot total)
@@ -106,19 +110,21 @@ struct DiscrepancyOutput {
 
 #[tokio::main]
 async fn main() {
-    const TIP_DISTRIBUTION_PROGRAM: Pubkey =
-        Pubkey::from_str("4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7").unwrap();
+    // let tip_distribution_program: Pubkey =
+    //     Pubkey::from_str("4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7").unwrap();
 
     println!("Starting...");
     let args: Args = Args::parse();
 
     println!("reading in snapshot files...");
+    let incorrect_snapshot_path = args.incorrect_snapshot_path.clone();
     let incorrect_snapshot: GeneratedMerkleTreeCollection =
-        spawn_blocking(read_json_from_file(&args.incorrect_snapshot_path).unwrap())
+        spawn_blocking(move || read_json_from_file(&incorrect_snapshot_path).unwrap())
             .await
             .unwrap();
+    let correct_snapshot_path = args.correct_snapshot_path.clone();
     let correct_snapshot: GeneratedMerkleTreeCollection =
-        spawn_blocking(read_json_from_file(&args.correct_snapshot_path).unwrap())
+        spawn_blocking(move || read_json_from_file(&correct_snapshot_path).unwrap())
             .await
             .unwrap();
 
@@ -140,7 +146,7 @@ async fn main() {
         "snapshots contain different tip distribution accounts"
     );
 
-    let rpc_client = RpcClient::new(args.rpc_url);
+    let rpc_client = Arc::new(RpcClient::new(args.rpc_url));
     println!(
         "rpc server version: {}",
         rpc_client.get_version().await.unwrap().solana_core
@@ -149,20 +155,20 @@ async fn main() {
     // Get all tip distribution accounts
     println!("fetching tip distribution accounts");
     let mut futs = Vec::with_capacity(incorrect_snapshot.generated_merkle_trees.len());
-    for tree in incorrect_snapshot.generated_merkle_trees {
-        futs.push(async {
-            let account = rpc_client
-                .get_account(&tree.tip_distribution_account)
-                .await?;
-            (tree.tip_distribution_account, account)
+    for tree in &incorrect_snapshot.generated_merkle_trees {
+        let tda = tree.tip_distribution_account;
+        let c = rpc_client.clone();
+        futs.push(async move {
+            let account = c.get_account(&tda).await;
+            (tda, account)
         });
     }
 
     // Deserialize accounts
     println!("deserializing tip distribution accounts");
     let mut onchain_tdas: Vec<(Pubkey, TipDistributionAccount)> = Vec::with_capacity(futs.len());
-    for maybe_account in join_all(futs).await {
-        let (pk, account) = maybe_account.unwrap();
+    for (pk, maybe_account) in join_all(futs).await {
+        let account = maybe_account.unwrap();
         let mut data = account.data.as_slice();
         onchain_tdas.push((
             pk,
@@ -194,7 +200,7 @@ async fn main() {
             validator_pubkey: tda.validator_vote_account,
             sol_diff,
         });
-        total_sol_diff += sol_diff.abs();
+        total_sol_diff += sol_diff.abs() as u64;
     }
     let output = DiscrepancyOutputColl {
         num_validators_affected: discrepancies.len(),
@@ -204,7 +210,8 @@ async fn main() {
 
     println!("writing discrepancies...");
 
-    spawn_blocking(write_to_json_file(output, &args.out_path).unwrap())
+    let out_path = args.out_path;
+    spawn_blocking(move || write_to_json_file(&output, &out_path).unwrap())
         .await
         .unwrap();
 
@@ -221,11 +228,8 @@ where
 }
 
 mod pubkey_string_conversion {
+    use serde::{self, Deserialize, Deserializer, Serializer};
     use solana_program::pubkey::Pubkey;
-    use {
-        serde::{self, Deserialize, Deserializer, Serializer},
-        std::str::FromStr,
-    };
 
     pub(crate) fn serialize<S>(pubkey: &Pubkey, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -243,10 +247,7 @@ mod pubkey_string_conversion {
     }
 }
 
-fn write_to_json_file(
-    data: &DiscrepancyOutputColl,
-    file_path: &PathBuf,
-) -> Result<(), MerkleRootGeneratorError> {
+fn write_to_json_file(data: &DiscrepancyOutputColl, file_path: &PathBuf) -> io::Result<()> {
     let file = File::create(file_path)?;
     let mut writer = BufWriter::new(file);
     let json = serde_json::to_string_pretty(&data).unwrap();
