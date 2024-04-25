@@ -44,9 +44,14 @@ struct Args {
     #[arg(long, env)]
     rpc_url: String,
 
-    /// Path write discrepancies to.
+    /// Path to write discrepancies to derived from the snapshot.
     #[arg(long, env)]
-    out_path: PathBuf,
+    snapshot_based_out_path: PathBuf,
+
+    /// Path to write discrepancies to derived from what's left in the affected tdas.
+    /// The numbers here should be equal to the snapshot based derivation.
+    #[arg(long, env)]
+    tda_based_out_path: PathBuf,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -176,21 +181,48 @@ async fn main() {
     }
 
     // Deserialize accounts
+    let mut rent_exempt = None;
     println!("deserializing tip distribution accounts");
-    let mut onchain_tdas: Vec<(Pubkey, TipDistributionAccount)> = Vec::with_capacity(futs.len());
+    let mut onchain_tdas: Vec<(Pubkey, u64 /* lamports */, TipDistributionAccount)> =
+        Vec::with_capacity(futs.len());
     for (pk, maybe_account) in join_all(futs).await {
         let account = maybe_account.unwrap();
         let mut data = account.data.as_slice();
+        if rent_exempt.is_none() {
+            rent_exempt = Some(
+                rpc_client
+                    .get_minimum_balance_for_rent_exemption(data.len())
+                    .await
+                    .unwrap(),
+            );
+        }
         onchain_tdas.push((
             pk,
+            account.lamports,
             TipDistributionAccount::try_deserialize(&mut data)
                 .expect("failed to deserialize tip_distribution_account state"),
         ));
     }
+    let rent_exempt = rent_exempt.unwrap();
 
-    let mut discrepancies = Vec::new();
+    struct Diffs {
+        validator_lamports_diff: i64,
+        staker_lamports_diff: i64,
+    }
+
+    let mut snapshot_based_discrepancies = Vec::new();
+    let mut onchain_based_discrepancies = Vec::new();
+
+    let mut total_snapshot_diffs = Diffs {
+        validator_lamports_diff: 0,
+        staker_lamports_diff: 0,
+    };
+    let mut total_onchain_diffs = Diffs {
+        validator_lamports_diff: 0,
+        staker_lamports_diff: 0,
+    };
     // Check the merkle roots against the snapshots
-    for (pk, tda) in onchain_tdas {
+    for (pk, account_lamports, tda) in onchain_tdas {
         let actual_root = tda.merkle_root.unwrap();
 
         let Some(correct_tda) = correct_roots.get(&pk) else {
@@ -201,15 +233,24 @@ async fn main() {
             continue;
         }
 
-        let correct_validator_amount = (correct_tda.max_total_claim as u128)
+        let snapshot_based_correct_validator_amount = (correct_tda.max_total_claim as u128)
             .checked_mul(tda.validator_commission_bps as u128)
             .unwrap()
             .checked_div(10_000)
             .unwrap() as i64;
-        let correct_staker_amount =
-            correct_tda.max_total_claim as i64 - correct_validator_amount as i64;
+        let snapshot_based_correct_staker_amount =
+            correct_tda.max_total_claim as i64 - snapshot_based_correct_validator_amount as i64;
 
-        let (validator_lamports_diff, staker_lamports_diff) = match incorrect_roots.get(&pk) {
+        let account_lamports = account_lamports - rent_exempt;
+        let onchain_based_validator_diff = (account_lamports as u128)
+            .checked_mul(tda.validator_commission_bps as u128)
+            .unwrap()
+            .checked_div(10_000)
+            .unwrap() as i64;
+        let onchain_based_staker_diff =
+            account_lamports as i64 - onchain_based_validator_diff as i64;
+
+        let snapshot_based_diffs = match incorrect_roots.get(&pk) {
             Some(incorrect_tda) => {
                 if actual_root.root != incorrect_tda.merkle_root.to_bytes() {
                     panic!(
@@ -219,11 +260,6 @@ async fn main() {
                 }
 
                 // Calc. incorrect amounts.
-                let correct_validator_amount = (correct_tda.max_total_claim as u128)
-                    .checked_mul(tda.validator_commission_bps as u128)
-                    .unwrap()
-                    .checked_div(10_000)
-                    .unwrap() as i64;
                 let incorrect_validator_amount = (incorrect_tda.max_total_claim as u128)
                     .checked_mul(tda.validator_commission_bps as u128)
                     .unwrap()
@@ -232,31 +268,61 @@ async fn main() {
                 let incorrect_staker_amount =
                     incorrect_tda.max_total_claim as i64 - incorrect_validator_amount as i64;
 
-                // Subtract validator's commission
-                (
-                    correct_validator_amount - incorrect_validator_amount,
-                    correct_staker_amount - incorrect_staker_amount,
-                )
+                Diffs {
+                    validator_lamports_diff: snapshot_based_correct_validator_amount
+                        - incorrect_validator_amount,
+                    staker_lamports_diff: snapshot_based_correct_staker_amount
+                        - incorrect_staker_amount,
+                }
             }
             // If not in the incorrect snapshot, then the validator probably came on later in the epoch after the incorrect snapshot was created.
             // Therefore we need to reimburse the entire thing from the correct amount.
             None => {
                 println!("missing {pk} from incorrect snapshot");
-                (correct_validator_amount, correct_staker_amount)
+                Diffs {
+                    validator_lamports_diff: snapshot_based_correct_validator_amount,
+                    staker_lamports_diff: snapshot_based_correct_staker_amount,
+                }
             }
         };
 
-        discrepancies.push(DiscrepancyOutput {
+        total_onchain_diffs.staker_lamports_diff += onchain_based_staker_diff;
+        total_onchain_diffs.validator_lamports_diff += onchain_based_validator_diff;
+
+        total_snapshot_diffs.staker_lamports_diff += snapshot_based_diffs.staker_lamports_diff;
+        total_snapshot_diffs.validator_lamports_diff +=
+            snapshot_based_diffs.validator_lamports_diff;
+
+        onchain_based_discrepancies.push(DiscrepancyOutput {
             validator_pubkey: tda.validator_vote_account,
-            staker_lamports_diff,
-            validator_lamports_diff,
+            staker_lamports_diff: onchain_based_staker_diff,
+            validator_lamports_diff: onchain_based_validator_diff,
+        });
+        snapshot_based_discrepancies.push(DiscrepancyOutput {
+            validator_pubkey: tda.validator_vote_account,
+            staker_lamports_diff: snapshot_based_diffs.staker_lamports_diff,
+            validator_lamports_diff: snapshot_based_diffs.validator_lamports_diff,
         });
     }
 
+    println!(
+        "onchain total validator diffs: {} onchain total staker diffs: {}",
+        total_onchain_diffs.validator_lamports_diff, total_onchain_diffs.staker_lamports_diff
+    );
+    println!(
+        "snapshot total validator diffs: {} snapshot total staker diffs: {}",
+        total_snapshot_diffs.validator_lamports_diff, total_snapshot_diffs.staker_lamports_diff
+    );
+
     println!("writing discrepancies...");
 
-    let out_path = args.out_path;
-    spawn_blocking(move || write_to_csv(&discrepancies, &out_path).unwrap())
+    let out_path = args.snapshot_based_out_path;
+    spawn_blocking(move || write_to_csv(&snapshot_based_discrepancies, &out_path).unwrap())
+        .await
+        .unwrap();
+
+    let out_path = args.tda_based_out_path;
+    spawn_blocking(move || write_to_csv(&onchain_based_discrepancies, &out_path).unwrap())
         .await
         .unwrap();
 
