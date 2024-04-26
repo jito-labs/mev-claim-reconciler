@@ -191,7 +191,7 @@ async fn main() {
         if rent_exempt.is_none() {
             rent_exempt = Some(
                 rpc_client
-                    .get_minimum_balance_for_rent_exemption(data.len())
+                    .get_minimum_balance_for_rent_exemption(TipDistributionAccount::SIZE)
                     .await
                     .unwrap(),
             );
