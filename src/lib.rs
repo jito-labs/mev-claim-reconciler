@@ -1,7 +1,13 @@
+use jito_tip_distribution::state::Config;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use solana_program::clock::{Epoch, Slot};
 use solana_program::hash::Hash;
 use solana_program::pubkey::Pubkey;
+use std::fs::File;
+use std::io;
+use std::io::{BufReader, BufWriter, Write};
+use std::path::PathBuf;
 
 #[derive(Deserialize, Serialize)]
 pub struct GeneratedMerkleTreeCollection {
@@ -86,4 +92,27 @@ mod pubkey_string_conversion {
         let s = String::deserialize(deserializer)?;
         Pubkey::from_str(&s).map_err(serde::de::Error::custom)
     }
+}
+
+pub fn read_json_from_file<T>(path: &PathBuf) -> serde_json::Result<T>
+where
+    T: DeserializeOwned,
+{
+    let file = File::open(path).unwrap();
+    let reader = BufReader::new(file);
+    serde_json::from_reader(reader)
+}
+
+pub fn derive_config_account_address(tip_distribution_program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[Config::SEED], tip_distribution_program_id)
+}
+
+fn write_to_json_file(discrepancies: &[TdaDistributions], out_path: &PathBuf) -> io::Result<()> {
+    let file = File::create(out_path)?;
+    let mut writer = BufWriter::new(file);
+    let json = serde_json::to_string_pretty(&discrepancies).unwrap();
+    writer.write_all(json.as_bytes())?;
+    writer.flush()?;
+
+    Ok(())
 }

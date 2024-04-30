@@ -1,25 +1,3 @@
-use anchor_lang::AccountDeserialize;
-use clap::Parser;
-use csv::Writer;
-use futures::future::join_all;
-use jito_tip_distribution::state::{Config, TipDistributionAccount};
-use mev_claim_reconciler::{
-    Distribution, GeneratedMerkleTree, GeneratedMerkleTreeCollection, TdaDistributions, TreeNode,
-};
-use serde::de::DeserializeOwned;
-use solana_program::pubkey::Pubkey;
-use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io;
-use std::io::BufReader;
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::task::spawn_blocking;
-use tokio::time::sleep;
-
 /// Issue occurred on 04/23/2024 where one warehouse node created an incorrect snapshot and uploaded
 /// that as the root for some TDAs. The snapshot was incorrect because it only included ~91% of epoch
 /// 603's slots ending at slot 260889752 as opposed to slot 260927999. This script is responsible for
@@ -32,6 +10,26 @@ use tokio::time::sleep;
 ///         a. subtract rent from total lamports in TDA, calculate validator commission
 ///         b. subtracting the above, calculate staker pro-rata distributions
 ///     3. Spit the distribution numbers out to a CSV
+use anchor_lang::AccountDeserialize;
+use clap::Parser;
+use futures::future::join_all;
+use jito_tip_distribution::state::{Config, TipDistributionAccount};
+use mev_claim_reconciler::{
+    Distribution, GeneratedMerkleTree, GeneratedMerkleTreeCollection, TdaDistributions, TreeNode,
+};
+use serde::de::DeserializeOwned;
+use solana_program::pubkey::Pubkey;
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io;
+use std::io::{BufReader, BufWriter, Write};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::spawn_blocking;
+use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -100,7 +98,7 @@ async fn main() {
     println!("writing to file...");
 
     let out_path = args.out_path;
-    spawn_blocking(move || write_to_csv(&distributions, &out_path).unwrap())
+    spawn_blocking(move || write_to_json_file(&distributions, &out_path).unwrap())
         .await
         .unwrap();
 
@@ -203,8 +201,9 @@ fn calc_distributions(tda_cxs: Vec<TdaContext>, rent_exempt: u64) -> Vec<TdaDist
             //                    (incorrect_amount_claimed_by_staker)                    X
             //    staker_amount = ------------------------------------ = ------------------------------------
             //                        (incorrect_max_total_claim)       (remaining_funds_in_tda - rent_exempt - validator_commission)
-            let amount = (n.amount * staker_pot) / cx.incorrect_snapshot.max_total_claim;
-            staker_amounts.insert(n.claimant, amount);
+            let amount = (n.amount as u128 * staker_pot as u128)
+                / cx.incorrect_snapshot.max_total_claim as u128;
+            staker_amounts.insert(n.claimant, amount as u64);
         }
 
         let mut distributions = Vec::with_capacity(cx.incorrect_snapshot.tree_nodes.len());
@@ -226,24 +225,4 @@ fn calc_distributions(tda_cxs: Vec<TdaContext>, rent_exempt: u64) -> Vec<TdaDist
         });
     }
     tda_distributions
-}
-pub fn read_json_from_file<T>(path: &PathBuf) -> serde_json::Result<T>
-where
-    T: DeserializeOwned,
-{
-    let file = File::open(path).unwrap();
-    let reader = BufReader::new(file);
-    serde_json::from_reader(reader)
-}
-
-pub fn derive_config_account_address(tip_distribution_program_id: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[Config::SEED], tip_distribution_program_id)
-}
-
-fn write_to_csv(discrepancies: &[TdaDistributions], out_path: &PathBuf) -> io::Result<()> {
-    let mut w = Writer::from_path(out_path)?;
-    for d in discrepancies {
-        w.serialize(d)?;
-    }
-    w.flush()
 }
