@@ -18,3 +18,7 @@ solana-program = "1.16"
 solana-rpc-client = "1.16"
 tokio = { version = "1", features = ["full"] }
 
+[[bin]]
+name = "reconciler"
+path = "bin/reconciler.rs"
+
