@@ -19,6 +19,5 @@ solana-rpc-client = "1.16"
 tokio = { version = "1", features = ["full"] }
 
 [[bin]]
-name = "reconciler"
-path = "bin/reconciler.rs"
-
+name = "calc_distributions"
+path = "bin/calc_distributions.rs"
