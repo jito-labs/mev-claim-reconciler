@@ -192,86 +192,32 @@ async fn get_affected_validator_tdas(
 
 fn calc_distributions(tda_cxs: Vec<TdaContext>) -> Vec<TdaDistributions> {
     let mut tda_distributions = Vec::with_capacity(tda_cxs.len());
-    for cx in tda_cxs {
+    for cx in &tda_cxs {
+        let mut distributions = Vec::with_capacity(cx.incorrect_snapshot.tree_nodes.len());
         // Total pot remaining
         let max_claim_snapshot_diff = cx
             .correct_snapshot
             .max_total_claim
             .checked_sub(cx.incorrect_snapshot.max_total_claim)
             .unwrap();
-
-        // If it's 0 then no new MEV was collected for this validator
-        if max_claim_snapshot_diff == 0 {
-            continue;
-        }
-
-        // Validator's diff owed
-        let validator_amount_owed = (max_claim_snapshot_diff as u128)
-            .checked_mul(cx.tda.validator_commission_bps as u128)
-            .unwrap()
-            .checked_div(10_000)
-            .unwrap() as u64;
-
-        // Subtract validator from total available
-        let total_staker_amount_owed = max_claim_snapshot_diff
-            .checked_sub(validator_amount_owed)
-            .unwrap();
-
-        // Get all tree nodes that are not the validator
-        let mut validator_claimed_amount = 0;
-        let staker_nodes: Vec<&TreeNode> = cx
-            .correct_snapshot
+        let incorrect_trees: HashMap<Pubkey, &TreeNode> = cx
+            .incorrect_snapshot
             .tree_nodes
             .iter()
-            .filter(|n| {
-                if n.claimant != cx.tda.validator_vote_account {
-                    true
-                } else {
-                    validator_claimed_amount = n.amount;
-                    false
-                }
-            })
+            .map(|t| (t.claimant, t))
             .collect();
-
-        // The expected validator commission.
-        let expected_validator_amount = (cx.correct_snapshot.max_total_claim as u128)
-            .checked_mul(cx.tda.validator_commission_bps as u128)
-            .unwrap()
-            .checked_div(10_000)
-            .unwrap() as u64;
-        let staker_max_claimed = (cx
-            .correct_snapshot
-            .max_total_claim
-            .checked_sub(expected_validator_amount))
-        .unwrap() as u128;
-
-        let mut staker_amounts = HashMap::with_capacity(staker_nodes.len());
-        if staker_max_claimed > 0 {
-            for n in staker_nodes {
-                // The max that was claimed (this is the incorrect number derived by the incorrect snapshot and what's uploaded on-chain).
-                // We can use what was uploaded on-chain to figure out the pro-rate distributions. For example:
-                // staker_amount = (correct_staker_claim_amount)/(correct_max_total_claim - validator_commission) = X/(max_claim_snap_diff - validator_commission)
-                let amount = (n.amount as u128)
-                    .checked_mul(total_staker_amount_owed as u128)
-                    .unwrap()
-                    .checked_div(staker_max_claimed)
-                    .unwrap();
-                staker_amounts.insert(n.claimant, amount as u64);
-            }
-        }
-
-        let mut distributions = Vec::with_capacity(cx.incorrect_snapshot.tree_nodes.len());
-        for (receiver, amount_lamports) in staker_amounts {
+        for correct_tree in &cx.correct_snapshot.tree_nodes {
+            let incorrect_amount = if let Some(tree) = incorrect_trees.get(&correct_tree.claimant) {
+                tree.amount
+            } else {
+                // if not in incorrect_tree then could have been a stake account that came online after the snapshot
+                0
+            };
             distributions.push(Distribution {
-                receiver,
-                amount_lamports,
+                receiver: correct_tree.claimant,
+                amount_lamports: correct_tree.amount.checked_sub(incorrect_amount).unwrap(),
             });
         }
-        distributions.push(Distribution {
-            receiver: cx.tda.validator_vote_account,
-            amount_lamports: validator_amount_owed,
-        });
-
         tda_distributions.push(TdaDistributions {
             tda_pubkey: cx.tda_pubkey,
             validator_pubkey: cx.tda.validator_vote_account,
@@ -279,5 +225,6 @@ fn calc_distributions(tda_cxs: Vec<TdaContext>) -> Vec<TdaDistributions> {
             distributions,
         });
     }
+
     tda_distributions
 }
