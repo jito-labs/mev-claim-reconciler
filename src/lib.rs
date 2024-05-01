@@ -1,3 +1,4 @@
+use csv::Writer;
 use jito_tip_distribution::state::Config;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -55,7 +56,7 @@ pub struct TreeNode {
     pub proof: Vec<[u8; 32]>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct TdaDistributions {
     #[serde(with = "pubkey_string_conversion")]
     pub tda_pubkey: Pubkey,
@@ -68,7 +69,7 @@ pub struct TdaDistributions {
     pub distributions: Vec<Distribution>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Distribution {
     #[serde(with = "pubkey_string_conversion")]
     pub receiver: Pubkey,
@@ -128,4 +129,29 @@ pub fn write_to_json_file(
     writer.flush()?;
 
     Ok(())
+}
+
+pub fn write_to_csv_file(
+    tda_distributions: &[TdaDistributions],
+    out_path: &PathBuf,
+) -> io::Result<()> {
+    #[derive(Deserialize, Serialize)]
+    struct FlattenedDistribution {
+        #[serde(with = "pubkey_string_conversion")]
+        pub tda_pubkey: Pubkey,
+        #[serde(with = "pubkey_string_conversion")]
+        pub receiver: Pubkey,
+        pub amount_lamports: u64,
+    }
+    let mut w = Writer::from_path(out_path)?;
+    for d0 in tda_distributions {
+        for d1 in &d0.distributions {
+            w.serialize(FlattenedDistribution {
+                tda_pubkey: d0.tda_pubkey,
+                receiver: d1.receiver,
+                amount_lamports: d1.amount_lamports,
+            })?;
+        }
+    }
+    w.flush()
 }

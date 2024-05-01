@@ -15,8 +15,8 @@ use clap::Parser;
 use futures::future::join_all;
 use jito_tip_distribution::state::{Config, TipDistributionAccount};
 use mev_claim_reconciler::{
-    derive_config_account_address, read_json_from_file, write_to_json_file, Distribution,
-    GeneratedMerkleTree, GeneratedMerkleTreeCollection, TdaDistributions, TreeNode,
+    derive_config_account_address, read_json_from_file, write_to_csv_file, write_to_json_file,
+    Distribution, GeneratedMerkleTree, GeneratedMerkleTreeCollection, TdaDistributions, TreeNode,
 };
 use solana_program::pubkey::Pubkey;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
@@ -43,9 +43,13 @@ struct Args {
     #[arg(long, env)]
     rpc_url: String,
 
-    /// Path to write output to.
+    /// Path to write JSON output to.
     #[arg(long, env)]
-    out_path: PathBuf,
+    json_out_path: PathBuf,
+
+    /// Path to write CSV output to.
+    #[arg(long, env)]
+    csv_out_path: PathBuf,
 }
 
 #[tokio::main]
@@ -99,8 +103,14 @@ async fn main() {
 
     println!("writing to file...");
 
-    let out_path = args.out_path;
-    spawn_blocking(move || write_to_json_file(&distributions, &out_path).unwrap())
+    let json_out_path = args.json_out_path;
+    let _distributions = distributions.clone();
+    spawn_blocking(move || write_to_json_file(&distributions, &json_out_path).unwrap())
+        .await
+        .unwrap();
+
+    let csv_out_path = args.csv_out_path;
+    spawn_blocking(move || write_to_csv_file(&_distributions, &csv_out_path).unwrap())
         .await
         .unwrap();
 
