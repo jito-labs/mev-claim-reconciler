@@ -206,16 +206,27 @@ fn calc_distributions(tda_cxs: Vec<TdaContext>) -> Vec<TdaDistributions> {
             .iter()
             .map(|t| (t.claimant, t))
             .collect();
-        for correct_tree in &cx.correct_snapshot.tree_nodes {
-            let incorrect_amount = if let Some(tree) = incorrect_trees.get(&correct_tree.claimant) {
-                tree.amount
-            } else {
-                // if not in incorrect_tree then could have been a stake account that came online after the snapshot
-                0
-            };
+        for correct_tree_node in &cx.correct_snapshot.tree_nodes {
+            let incorrect_amount =
+                if let Some(tree_node) = incorrect_trees.get(&correct_tree_node.claimant) {
+                    tree_node.amount
+                } else {
+                    // if not in incorrect_tree then could have been a stake account that came online after the snapshot
+                    0
+                };
+            if incorrect_amount > correct_tree_node.amount {
+                println!(
+                    "claimant: {}, incorrect_amount: {incorrect_amount}, correct_amount: {}",
+                    correct_tree_node.claimant, correct_tree_node.amount
+                );
+                continue;
+            }
             distributions.push(Distribution {
-                receiver: correct_tree.claimant,
-                amount_lamports: correct_tree.amount.checked_sub(incorrect_amount).unwrap(),
+                receiver: correct_tree_node.claimant,
+                amount_lamports: correct_tree_node
+                    .amount
+                    .checked_sub(incorrect_amount)
+                    .unwrap(),
             });
         }
         tda_distributions.push(TdaDistributions {
