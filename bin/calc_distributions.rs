@@ -15,15 +15,12 @@ use clap::Parser;
 use futures::future::join_all;
 use jito_tip_distribution::state::{Config, TipDistributionAccount};
 use mev_claim_reconciler::{
-    Distribution, GeneratedMerkleTree, GeneratedMerkleTreeCollection, TdaDistributions, TreeNode,
+    derive_config_account_address, read_json_from_file, write_to_json_file, Distribution,
+    GeneratedMerkleTree, GeneratedMerkleTreeCollection, TdaDistributions, TreeNode,
 };
-use serde::de::DeserializeOwned;
 use solana_program::pubkey::Pubkey;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io;
-use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -85,7 +82,7 @@ async fn main() {
         .unwrap();
 
     // Run the calcs
-    let distributions = calc_distributions(affected_tda_cxs, rent_exempt);
+    let distributions = calc_distributions(affected_tda_cxs.into_values().collect(), rent_exempt);
 
     println!(
         "Total funds remaining: {}",
@@ -106,20 +103,19 @@ async fn main() {
 }
 
 struct TdaContext {
-    /// The tda itself
+    /// The tda itself, fetched from the chain.
     tda: TipDistributionAccount,
     /// The amount of lamports in the account
     lamports: u64,
-    /// The tda's pubkey
-    pubkey: Pubkey,
-    /// Snapshot of the validator's merkle tree.
+    /// Snapshot of the validator's merkle tree, this is what was uploaded to the chain.
     incorrect_snapshot: GeneratedMerkleTree,
+    tda_pubkey: Pubkey,
 }
 
 async fn get_affected_validator_tdas(
     incorrect_snapshot: GeneratedMerkleTreeCollection,
     rpc_client: &Arc<RpcClient>,
-) -> Vec<TdaContext> {
+) -> HashMap<Pubkey /* tda pda */, TdaContext> {
     // Get all tip distribution accounts
     println!("fetching tip distribution accounts");
     let mut futs = Vec::with_capacity(incorrect_snapshot.generated_merkle_trees.len());
@@ -129,11 +125,11 @@ async fn get_affected_validator_tdas(
             const MAX_RETRIES: usize = 10;
             let mut retry_count = 0;
 
-            let tda_key = tree.tip_distribution_account;
+            let tda_pubkey = tree.tip_distribution_account;
             let incorrect_merkle_root = tree.merkle_root.to_bytes();
 
             loop {
-                let resp = c.get_account(&tda_key).await;
+                let resp = c.get_account(&tda_pubkey).await;
                 if resp.is_ok() {
                     let account = resp.unwrap();
                     let mut data = account.data.as_slice();
@@ -142,9 +138,9 @@ async fn get_affected_validator_tdas(
                             .expect("failed to deserialize tip_distribution_account state");
                     return if tda.merkle_root.as_ref().unwrap().root == incorrect_merkle_root {
                         Ok(Some(TdaContext {
+                            tda_pubkey,
                             tda,
                             lamports: account.lamports,
-                            pubkey: tda_key,
                             incorrect_snapshot: tree,
                         }))
                     } else {
@@ -160,11 +156,11 @@ async fn get_affected_validator_tdas(
         });
     }
 
-    let mut tdas = Vec::with_capacity(futs.len());
+    let mut tdas = HashMap::with_capacity(futs.len());
     for maybe_tda_context in join_all(futs).await {
         let tda_context = maybe_tda_context.unwrap();
         if let Some(tda_context) = tda_context {
-            tdas.push(tda_context);
+            tdas.insert(tda_context.tda_pubkey, tda_context);
         }
     }
     tdas
@@ -174,36 +170,50 @@ fn calc_distributions(tda_cxs: Vec<TdaContext>, rent_exempt: u64) -> Vec<TdaDist
     let mut tda_distributions = Vec::with_capacity(tda_cxs.len());
     for cx in tda_cxs {
         // Total pot available
-        let total_pot = cx.lamports - rent_exempt;
+        let total_pot_remaining = cx.lamports - rent_exempt;
+        if total_pot_remaining == 0 {
+            continue;
+        }
 
-        // Validator's funds
-        let validator_amount = (total_pot as u128)
+        // Validator's remaining funds
+        let validator_amount_remaining = (total_pot_remaining as u128)
             .checked_mul(cx.tda.validator_commission_bps as u128)
             .unwrap()
             .checked_div(10_000)
             .unwrap() as u64;
 
-        // Subtract validator from total_pot
-        let staker_pot = total_pot - validator_amount;
+        // Subtract validator from total available
+        let staker_pot_remaining = total_pot_remaining - validator_amount_remaining;
 
         // Get all tree nodes that are not the validator
+        let mut validator_claimed_amount = 0;
         let staker_nodes: Vec<&TreeNode> = cx
             .incorrect_snapshot
             .tree_nodes
             .iter()
-            .filter(|n| n.claimant != cx.tda.validator_vote_account)
+            .filter(|n| {
+                if n.claimant != cx.tda.validator_vote_account {
+                    true
+                } else {
+                    validator_claimed_amount = n.amount;
+                    false
+                }
+            })
             .collect();
+        let staker_max_claimed =
+            (cx.incorrect_snapshot.max_total_claim - validator_claimed_amount) as u128;
 
         let mut staker_amounts = HashMap::with_capacity(staker_nodes.len());
-        for n in staker_nodes {
-            // The max that was claimed (this is the incorrect number derived by the incorrect snapshot and what's uploaded on-chain).
-            // We can use what was uploaded on-chain to figure out the pro-rate distributions. For example:
-            //                    (incorrect_amount_claimed_by_staker)                    X
-            //    staker_amount = ------------------------------------ = ------------------------------------
-            //                        (incorrect_max_total_claim)       (remaining_funds_in_tda - rent_exempt - validator_commission)
-            let amount = (n.amount as u128 * staker_pot as u128)
-                / cx.incorrect_snapshot.max_total_claim as u128;
-            staker_amounts.insert(n.claimant, amount as u64);
+        if staker_max_claimed > 0 {
+            for n in staker_nodes {
+                // The max that was claimed (this is the incorrect number derived by the incorrect snapshot and what's uploaded on-chain).
+                // We can use what was uploaded on-chain to figure out the pro-rate distributions. For example:
+                //                    (incorrect_amount_claimed_by_staker)                    X
+                //    staker_amount = ------------------------------------ = ------------------------------------
+                //                        (incorrect_max_total_claim)       (remaining_funds_in_tda - rent_exempt - validator_commission)
+                let amount = (n.amount as u128 * staker_pot_remaining as u128) / staker_max_claimed;
+                staker_amounts.insert(n.claimant, amount as u64);
+            }
         }
 
         let mut distributions = Vec::with_capacity(cx.incorrect_snapshot.tree_nodes.len());
@@ -215,12 +225,13 @@ fn calc_distributions(tda_cxs: Vec<TdaContext>, rent_exempt: u64) -> Vec<TdaDist
         }
         distributions.push(Distribution {
             receiver: cx.tda.validator_vote_account,
-            amount_lamports: validator_amount,
+            amount_lamports: validator_amount_remaining,
         });
 
         tda_distributions.push(TdaDistributions {
+            tda_pubkey: cx.tda_pubkey,
             validator_pubkey: cx.tda.validator_vote_account,
-            total_remaining_lamports: total_pot,
+            total_remaining_lamports: total_pot_remaining,
             distributions,
         });
     }

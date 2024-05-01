@@ -58,6 +58,8 @@ pub struct TreeNode {
 #[derive(Deserialize, Serialize)]
 pub struct TdaDistributions {
     #[serde(with = "pubkey_string_conversion")]
+    pub tda_pubkey: Pubkey,
+    #[serde(with = "pubkey_string_conversion")]
     pub validator_pubkey: Pubkey,
 
     /// Total amount that needs to get redistributed.
@@ -107,7 +109,10 @@ pub fn derive_config_account_address(tip_distribution_program_id: &Pubkey) -> (P
     Pubkey::find_program_address(&[Config::SEED], tip_distribution_program_id)
 }
 
-fn write_to_json_file(discrepancies: &[TdaDistributions], out_path: &PathBuf) -> io::Result<()> {
+pub fn write_to_json_file(
+    discrepancies: &[TdaDistributions],
+    out_path: &PathBuf,
+) -> io::Result<()> {
     let file = File::create(out_path)?;
     let mut writer = BufWriter::new(file);
     let json = serde_json::to_string_pretty(&discrepancies).unwrap();

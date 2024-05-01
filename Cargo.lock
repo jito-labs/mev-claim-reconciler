@@ -1916,6 +1916,7 @@ dependencies = [
  "serde_json",
  "solana-program",
  "solana-rpc-client",
+ "solana-sdk",
  "tokio",
 ]
 
