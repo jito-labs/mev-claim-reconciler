@@ -75,6 +75,14 @@ pub struct Distribution {
     pub amount_lamports: u64,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct CompletedDistribution {
+    #[serde(with = "pubkey_string_conversion")]
+    pub receiver: Pubkey,
+    #[serde(with = "pubkey_string_conversion")]
+    pub tda: Pubkey,
+}
+
 mod pubkey_string_conversion {
     use serde::{self, Deserialize, Deserializer, Serializer};
     use solana_program::pubkey::Pubkey;

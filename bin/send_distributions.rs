@@ -4,8 +4,7 @@
 /// NOTE: This script is not idempotent, meaning if it is ran multiple times it may over pay
 /// some accounts. To safeguard against this
 use clap::Parser;
-use mev_claim_reconciler::{read_json_from_file, TdaDistributions};
-use solana_program::pubkey::Pubkey;
+use mev_claim_reconciler::{read_json_from_file, CompletedDistribution, TdaDistributions};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::{EncodableKey, Keypair};
 use std::path::PathBuf;
@@ -32,14 +31,6 @@ struct Args {
     funding_wallet_path: Option<PathBuf>,
 }
 
-#[derive(Deserialize, Serialize)]
-struct CompletedDistribution {
-    #[serde(with = "pubkey_string_conversion")]
-    receiver: Pubkey,
-    #[serde(with = "pubkey_string_conversion")]
-    tda: Pubkey,
-}
-
 #[tokio::main]
 async fn main() {
     println!("Starting...");
@@ -48,7 +39,7 @@ async fn main() {
 
     let maybe_rpc_client_and_keypair = if let Some(keypair_path) = &args.funding_wallet_path {
         println!("Keypair path supplied, reading in key.");
-        let keypair = Keypair::read_from_file(path).unwrap();
+        let keypair = Keypair::read_from_file(keypair_path).unwrap();
         let rpc_client = Arc::new(RpcClient::new(args.rpc_url));
         println!(
             "rpc server version: {}",
@@ -79,7 +70,7 @@ async fn main() {
         for d1 in d0.distributions {
             if completed_distributions
                 .iter()
-                .find(|c| c.receiver == d1.receiver && c.tda == d0.tda)
+                .find(|c| c.receiver == d1.receiver && c.tda == d0.tda_pubkey)
                 .is_none()
             {
                 incomplete_distributions.push(d1);
@@ -87,7 +78,7 @@ async fn main() {
         }
     }
 
-    let remaining_lamports = incomplete_distributions
+    let remaining_lamports: u64 = incomplete_distributions
         .iter()
         .map(|d| d.amount_lamports)
         .sum();
