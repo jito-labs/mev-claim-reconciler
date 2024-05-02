@@ -114,7 +114,7 @@ where
     serde_json::from_reader(reader)
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Copy, Clone, Eq, PartialEq, Deserialize, Serialize)]
 pub struct FlattenedDistribution {
     #[serde(with = "pubkey_string_conversion")]
     pub tda_pubkey: Pubkey,
