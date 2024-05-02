@@ -11,8 +11,11 @@ use mev_claim_reconciler::{append_to_csv_file, read_csv_from_file, FlattenedDist
 use solana_program::hash::Hash;
 use solana_program::system_instruction::transfer;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_rpc_client_api::config::RpcSendTransactionConfig;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::{EncodableKey, Keypair, Signer};
 use solana_sdk::transaction::{Transaction, VersionedTransaction};
+use solana_transaction_status::UiTransactionEncoding;
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -225,7 +228,20 @@ async fn send_and_confirm_transactions(
             recent_blockhash.hash,
         ));
         futs.push(async move {
-            match rpc_client.send_and_confirm_transaction(&tx).await {
+            match rpc_client
+                .send_and_confirm_transaction_with_spinner_and_config(
+                    &tx,
+                    CommitmentConfig::confirmed(),
+                    RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: None,
+                        encoding: Some(UiTransactionEncoding::Base64),
+                        max_retries: Some(0),
+                        min_context_slot: None,
+                    },
+                )
+                .await
+            {
                 Ok(_) => Some(*d),
                 Err(e) => {
                     debug!("error confirming tx: {e:?}");
