@@ -9,6 +9,7 @@ use futures::future::join_all;
 use log::*;
 use mev_claim_reconciler::{append_to_csv_file, read_csv_from_file, FlattenedDistribution};
 use solana_program::hash::Hash;
+use solana_program::pubkey::Pubkey;
 use solana_program::system_instruction::transfer;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client_api::config::RpcSendTransactionConfig;
@@ -18,6 +19,7 @@ use solana_sdk::transaction::{Transaction, VersionedTransaction};
 use solana_transaction_status::UiTransactionEncoding;
 use std::path::PathBuf;
 use std::process;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,6 +45,9 @@ struct Args {
     funding_wallet_path: Option<PathBuf>,
 }
 
+// Figment wants funds sent to a different account, so skip over them.
+const FIGMENT_VOTE_ACCOUNT: &str = "26pV97Ce83ZQ6Kz9XT4td8tdoUFPTng8Fb8gPyc53dJx";
+
 fn main() {
     env_logger::init();
 
@@ -50,6 +55,7 @@ fn main() {
 
     let args: Args = Args::parse();
     let runtime = Arc::new(Runtime::new().unwrap());
+    let figment_vote_account = Pubkey::from_str(FIGMENT_VOTE_ACCOUNT).unwrap();
 
     let exit = Arc::new(AtomicBool::new(false));
 
@@ -105,6 +111,7 @@ fn main() {
             .iter()
             .find(|c| c.receiver == d.receiver && c.tda_pubkey == d.tda_pubkey)
             .is_none()
+            && d.receiver != figment_vote_account
         {
             incomplete_distributions.push(d);
         }
