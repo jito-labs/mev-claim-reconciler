@@ -1,13 +1,13 @@
-use csv::Writer;
+use csv::{Reader, Writer};
 use jito_tip_distribution::state::Config;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use solana_program::clock::{Epoch, Slot};
 use solana_program::hash::Hash;
 use solana_program::pubkey::Pubkey;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Seek, Write};
 use std::path::PathBuf;
 
 #[derive(Deserialize, Serialize)]
@@ -114,6 +114,44 @@ where
     serde_json::from_reader(reader)
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct FlattenedDistribution {
+    #[serde(with = "pubkey_string_conversion")]
+    pub tda_pubkey: Pubkey,
+    #[serde(with = "pubkey_string_conversion")]
+    pub receiver: Pubkey,
+    pub amount_lamports: u64,
+}
+
+pub fn read_csv_from_file<T>(path: &PathBuf) -> csv::Result<Vec<T>>
+where
+    T: DeserializeOwned,
+{
+    let mut reader = Reader::from_path(path).unwrap();
+    let mut out: Vec<T> = vec![];
+    let mut iter = reader.deserialize();
+    while let Some(row) = iter.next() {
+        out.push(row?);
+    }
+    Ok(out)
+}
+// pub fn read_csv_from_file_every_other_row<T>(path: &PathBuf) -> csv::Result<Vec<T>>
+// where
+//     T: DeserializeOwned,
+// {
+//     let mut reader = Reader::from_path(path).unwrap();
+//     let mut out: Vec<T> = vec![];
+//     let mut iter = reader.deserialize();
+//     let mut i = 0;
+//     while let Some(row) = iter.next() {
+//         if i % 2 == 0 {
+//             out.push(row?);
+//         }
+//         i += 1;
+//     }
+//     Ok(out)
+// }
+
 pub fn derive_config_account_address(tip_distribution_program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[Config::SEED], tip_distribution_program_id)
 }
@@ -131,18 +169,24 @@ pub fn write_to_json_file(
     Ok(())
 }
 
+pub fn append_to_csv_file(dist: &FlattenedDistribution, out_path: &PathBuf) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(out_path)
+        .unwrap();
+    let needs_headers = file.seek(io::SeekFrom::End(0))? == 0;
+    let mut w = csv::WriterBuilder::new()
+        .has_headers(needs_headers)
+        .from_writer(file);
+    w.serialize(dist)?;
+    w.flush()
+}
+
 pub fn write_to_csv_file(
     tda_distributions: &[TdaDistributions],
     out_path: &PathBuf,
 ) -> io::Result<()> {
-    #[derive(Deserialize, Serialize)]
-    struct FlattenedDistribution {
-        #[serde(with = "pubkey_string_conversion")]
-        pub tda_pubkey: Pubkey,
-        #[serde(with = "pubkey_string_conversion")]
-        pub receiver: Pubkey,
-        pub amount_lamports: u64,
-    }
     let mut w = Writer::from_path(out_path)?;
     for d0 in tda_distributions {
         for d1 in &d0.distributions {

@@ -4,7 +4,10 @@
 /// NOTE: This script is not idempotent, meaning if it is ran multiple times it may over pay
 /// some accounts. To safeguard against this
 use clap::Parser;
-use mev_claim_reconciler::{read_json_from_file, CompletedDistribution, TdaDistributions};
+use mev_claim_reconciler::{
+    append_to_csv_file, read_csv_from_file, CompletedDistribution, FlattenedDistribution,
+    TdaDistributions,
+};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::{EncodableKey, Keypair};
 use std::path::PathBuf;
@@ -53,28 +56,26 @@ async fn main() {
 
     println!("reading in distributions");
     let distributions_path = args.distributions_path.clone();
-    let distributions: Vec<TdaDistributions> =
-        spawn_blocking(move || read_json_from_file(&distributions_path).unwrap())
+    let distributions: Vec<FlattenedDistribution> =
+        spawn_blocking(move || read_csv_from_file(&distributions_path).unwrap())
             .await
             .unwrap();
 
     println!("reading completed distributions path");
     let completed_distributions_path = args.completed_distributions_path.clone();
-    let completed_distributions: Vec<CompletedDistribution> =
-        spawn_blocking(move || read_json_from_file(&completed_distributions_path).unwrap())
+    let completed_distributions: Vec<FlattenedDistribution> =
+        spawn_blocking(move || read_csv_from_file(&completed_distributions_path).unwrap())
             .await
             .unwrap();
 
     let mut incomplete_distributions = Vec::new();
-    for d0 in distributions {
-        for d1 in d0.distributions {
-            if completed_distributions
-                .iter()
-                .find(|c| c.receiver == d1.receiver && c.tda == d0.tda_pubkey)
-                .is_none()
-            {
-                incomplete_distributions.push(d1);
-            }
+    for d in distributions {
+        if completed_distributions
+            .iter()
+            .find(|c| c.receiver == d.receiver && c.tda_pubkey == d.tda_pubkey)
+            .is_none()
+        {
+            incomplete_distributions.push(d);
         }
     }
 
@@ -83,4 +84,39 @@ async fn main() {
         .map(|d| d.amount_lamports)
         .sum();
     println!("remaining lamports: {}", remaining_lamports);
+    println!(
+        "remaining distributions: {}",
+        incomplete_distributions.len()
+    );
+
+    if let Some((rpc_client, funder)) = maybe_rpc_client_and_keypair {
+        send_transactions(
+            rpc_client,
+            funder,
+            args.completed_distributions_path,
+            completed_distributions,
+        )
+        .await;
+    }
+}
+
+async fn send_transactions(
+    rpc_client: Arc<RpcClient>,
+    funder: Keypair,
+    completed_distributions_path: PathBuf,
+    completed_distributions: Vec<FlattenedDistribution>,
+) {
+    let mut c = 0;
+    while c < 10 {
+        append_to_csv_file(
+            &FlattenedDistribution {
+                tda_pubkey: Default::default(),
+                receiver: Default::default(),
+                amount_lamports: c,
+            },
+            &completed_distributions_path,
+        )
+        .expect("TODO: panic message");
+        c += 1;
+    }
 }
