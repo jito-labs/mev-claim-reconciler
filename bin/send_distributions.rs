@@ -14,6 +14,7 @@ use solana_program::system_instruction::transfer;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::signature::{EncodableKey, Keypair, Signer};
 use solana_sdk::transaction::{Transaction, VersionedTransaction};
 use solana_transaction_status::UiTransactionEncoding;
@@ -227,9 +228,13 @@ async fn send_and_confirm_transactions(
         };
     }
     let mut futs = Vec::with_capacity(batch.len());
+    let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(1_000);
     for d in batch {
         let tx = VersionedTransaction::from(Transaction::new_signed_with_payer(
-            &[transfer(&funder.pubkey(), &d.receiver, d.amount_lamports)],
+            &[
+                priority_fee_ix.clone(),
+                transfer(&funder.pubkey(), &d.receiver, d.amount_lamports),
+            ],
             Some(&funder.pubkey()),
             &[funder],
             recent_blockhash.hash,
