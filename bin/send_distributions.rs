@@ -13,7 +13,7 @@ use solana_program::pubkey::Pubkey;
 use solana_program::system_instruction::transfer;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client_api::config::RpcSendTransactionConfig;
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::signature::{EncodableKey, Keypair, Signer};
 use solana_sdk::transaction::{Transaction, VersionedTransaction};
@@ -86,7 +86,10 @@ fn main() {
     let maybe_rpc_client_and_keypair = if let Some(keypair_path) = &args.funding_wallet_path {
         info!("Keypair path supplied, reading in key.");
         let keypair = Keypair::read_from_file(keypair_path).unwrap();
-        let rpc_client = Arc::new(RpcClient::new(args.rpc_url));
+        let rpc_client = Arc::new(RpcClient::new_with_commitment(
+            args.rpc_url,
+            CommitmentConfig::confirmed(),
+        ));
         let rpc_version = runtime
             .block_on(rpc_client.get_version())
             .unwrap()
@@ -154,8 +157,11 @@ async fn send_transactions(
     mut incomplete_distributions: Vec<FlattenedDistribution>,
     exit: Arc<AtomicBool>,
 ) {
-    let mut recent_blockhash = match rpc_client.get_latest_blockhash().await {
-        Ok(hash) => RecentBlockhash {
+    let mut recent_blockhash = match rpc_client
+        .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+        .await
+    {
+        Ok((hash, _)) => RecentBlockhash {
             hash,
             last_updated: Instant::now(),
         },
@@ -215,8 +221,11 @@ async fn send_and_confirm_transactions(
     exit: &Arc<AtomicBool>,
 ) -> Vec<FlattenedDistribution> {
     if recent_blockhash.last_updated.elapsed() >= Duration::from_secs(30) {
-        *recent_blockhash = match rpc_client.get_latest_blockhash().await {
-            Ok(hash) => RecentBlockhash {
+        *recent_blockhash = match rpc_client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+            .await
+        {
+            Ok((hash, _)) => RecentBlockhash {
                 hash,
                 last_updated: Instant::now(),
             },
@@ -228,7 +237,7 @@ async fn send_and_confirm_transactions(
         };
     }
     let mut futs = Vec::with_capacity(batch.len());
-    let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(1_000);
+    let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(10);
     for d in batch {
         let tx = VersionedTransaction::from(Transaction::new_signed_with_payer(
             &[
@@ -247,8 +256,8 @@ async fn send_and_confirm_transactions(
                     RpcSendTransactionConfig {
                         skip_preflight: true,
                         preflight_commitment: None,
-                        encoding: Some(UiTransactionEncoding::Base64),
-                        max_retries: Some(0),
+                        encoding: None,
+                        max_retries: Some(3),
                         min_context_slot: None,
                     },
                 )
@@ -256,7 +265,10 @@ async fn send_and_confirm_transactions(
             {
                 Ok(_) => Some(*d),
                 Err(e) => {
-                    debug!("error confirming tx: {e:?}");
+                    debug!(
+                        "error confirming tx: {e:?}, b64 data: {}",
+                        base64::encode(tx.message.serialize())
+                    );
                     None
                 }
             }
