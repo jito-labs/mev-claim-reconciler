@@ -209,7 +209,7 @@ fn main() {
         incomplete_distributions.len()
     );
 
-    rt.spawn(async {
+    rt.spawn(async move {
         loop {
             send_transactions(
                 &completed_distributions_tx,
