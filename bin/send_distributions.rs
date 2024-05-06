@@ -82,9 +82,12 @@ fn main() {
     let rx = completed_distributions_rx.clone();
     let rt = runtime.clone();
     let c_exit = exit.clone();
+    let ctrl_c_exit = Arc::new(AtomicBool::new(false));
+    let c_ctrl_c_exit = ctrl_c_exit.clone();
     ctrlc::set_handler(move || {
         info!("received exit signal");
         c_exit.store(true, Ordering::Relaxed);
+        c_ctrl_c_exit.store(true, Ordering::Relaxed);
         while let Ok(dist) = rx.recv() {
             if let Err(e) = append_to_csv_file(&dist, &completed_distributions_path) {
                 error!(
@@ -210,7 +213,7 @@ fn main() {
     );
 
     rt.spawn(async move {
-        loop {
+        while !ctrl_c_exit.load(Ordering::Relaxed) {
             send_transactions(
                 &completed_distributions_tx,
                 &jito_client,
@@ -223,7 +226,7 @@ fn main() {
 
             warn!("Issues sending transactions, sleeping for a bit.");
             sleep(Duration::from_millis(5_000)).await;
-            exit.store(true, Ordering::Relaxed);
+            exit.store(false, Ordering::Relaxed);
         }
     });
     while let Ok(dist) = completed_distributions_rx.recv() {
